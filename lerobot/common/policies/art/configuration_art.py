@@ -20,9 +20,9 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 
 
-@PreTrainedConfig.register_subclass("act")
+@PreTrainedConfig.register_subclass("art")
 @dataclass
-class ACTConfig(PreTrainedConfig):
+class ARTConfig(PreTrainedConfig):
     """Configuration class for the Action Chunking Transformers policy.
 
     Defaults are configured for training on bimanual Aloha tasks like "insertion" or "transfer".
@@ -64,7 +64,7 @@ class ACTConfig(PreTrainedConfig):
         output_normalization_modes: Similar dictionary as `normalize_input_modes`, but to unnormalize to the
             original scale. Note that this is also used for normalizing the training targets.
         vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
-        pretrained_backbone_weights: Pretrained weights from torchvision to initalize the backbone.
+        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
             `None` means no pretrained weights.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
             convolution.
@@ -118,9 +118,9 @@ class ACTConfig(PreTrainedConfig):
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
-    n_decoder_layers: int = 1
+    n_decoder_layers: int = 2
     # VAE.
-    use_vae: bool = True
+    use_vae: bool = False
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
