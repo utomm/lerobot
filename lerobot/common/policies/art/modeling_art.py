@@ -110,6 +110,10 @@ class ARTPolicy(PreTrainedPolicy):
         queue is empty.
         """
         self.eval()
+        
+        # print everything in the batch, with shape info
+        # for k, v in batch.items():
+        #     print(f"{k}: {v.shape}")
 
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
@@ -141,7 +145,7 @@ class ARTPolicy(PreTrainedPolicy):
                 [batch[key] for key in self.config.image_features], dim=-4
             )
         batch = self.normalize_targets(batch)
-        actions_hat = self.model(batch)
+        actions_hat, _ = self.model(batch)
 
         l1_loss = (
             F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
@@ -358,10 +362,10 @@ class ART(nn.Module):
         prefix_len = cache[0][0].shape[-2]
         
         # print cache shapes, 2nd dim is 0,1 for k,v
-        for i, layer_cache in enumerate(cache):
-            print(f"Layer {i}:")
-            print(f"  Key shape: {layer_cache[0].shape}")
-            print(f"  Value shape: {layer_cache[1].shape}")
+        # for i, layer_cache in enumerate(cache):
+        #     print(f"Layer {i}:")
+        #     print(f"  Key shape: {layer_cache[0].shape}")
+        #     print(f"  Value shape: {layer_cache[1].shape}")
 
         # 2. State Projection (History + Future combined)
         # We don't slice history/future separately; we treat it as one sequence.
@@ -401,6 +405,11 @@ class ART(nn.Module):
                 'cache_kwargs': {'cache_position': None} # Default: Append to end
             }
         )
+        
+        # for i, layer_cache in enumerate(cache):
+        #     print(f"Layer {i}:")
+        #     print(f"final  Key shape: {layer_cache[0].shape}")
+        #     print(f"final  Value shape: {layer_cache[1].shape}")
 
         # 6. Extract Future (Indices corresponding to >= 0)
         future_out = decoder_out[:, hist_len:]
@@ -435,123 +444,43 @@ class ART(nn.Module):
             
         return mask
     
-class ARTEncoder(nn.Module):
-    """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
+
+
+class ARTEncoder(nn.Module):
     def __init__(self, config: ARTConfig, is_vae_encoder: bool = False):
         super().__init__()
-        self.is_vae_encoder = is_vae_encoder
-        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
-        
-        # MODIFIED: Pass layer_idx to ACTEncoderLayer
+        # Reusing ARTDecoderLayer logic but for Encoding
+        num_layers = config.n_vae_encoder_layers if is_vae_encoder else config.n_encoder_layers
         self.layers = nn.ModuleList([
-            ARTEncoderLayer(config, layer_idx=i) for i in range(num_layers)
+            ARTDecoderLayer(config, layer_idx=i) for i in range(num_layers)
         ])
-        
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 
-    def forward(
-        self, 
-        x: Tensor, 
-        pos_embed: Tensor | None = None, 
-        key_padding_mask: Tensor | None = None,
-        past_key_value: transformers.Cache | None = None # MODIFIED: Add cache arg
-    ) -> Tensor:
+    def forward(self, x: Tensor, past_key_value: transformers.Cache | None = None) -> Tensor:
         for layer in self.layers:
-            # MODIFIED: Pass cache to layer
+            # Encoder call: No RoPE indices, No Mask (Full Attention)
             x = layer(
-                x, 
-                pos_embed=pos_embed, 
-                key_padding_mask=key_padding_mask,
-                past_key_value=past_key_value 
+                x,
+                attention_mask=None,
+                cache=past_key_value,
+                attn_kwargs=None # No RoPE indices -> No Rotation applied
             )
         x = self.norm(x)
         return x
 
 
-class ARTEncoderLayer(nn.Module):
-    def __init__(self, config: ARTConfig, layer_idx: int = 0):
-        super().__init__()
-        # MODIFIED: Replace nn.MultiheadAttention with ACTEncoderAttention
-        self.self_attn = ARTEncoderAttention(config, layer_idx=layer_idx)
-
-        # Feed forward layers.
-        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
-        self.dropout = nn.Dropout(config.dropout)
-        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
-
-        self.norm1 = nn.LayerNorm(config.dim_model)
-        self.norm2 = nn.LayerNorm(config.dim_model)
-        self.dropout1 = nn.Dropout(config.dropout)
-        self.dropout2 = nn.Dropout(config.dropout)
-
-        self.activation = get_activation_fn(config.feedforward_activation)
-        self.pre_norm = config.pre_norm
-
-    def forward(
-        self, 
-        x, 
-        pos_embed: Tensor | None = None, 
-        key_padding_mask: Tensor | None = None,
-        past_key_value: transformers.Cache | None = None # MODIFIED: Add cache arg
-    ) -> Tensor:
-        skip = x
-        if self.pre_norm:
-            x = self.norm1(x)
-        
-        # Logic remains: add pos_embed to q and k, but not v
-        q = k = x if pos_embed is None else x + pos_embed
-        
-        # MODIFIED: Call custom attention with explicit q, k, v and cache
-        x = self.self_attn(
-            query=q, 
-            key=k, 
-            value=x, # Value does not get pos_embed
-            key_padding_mask=key_padding_mask,
-            past_key_value=past_key_value
-        )
-        
-        # Rest remains the same
-        x = skip + self.dropout1(x)
-        if self.pre_norm:
-            skip = x
-            x = self.norm2(x)
-        else:
-            x = self.norm1(x)
-            skip = x
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = skip + self.dropout2(x)
-        if not self.pre_norm:
-            x = self.norm2(x)
-        return x
-
 class ARTDecoder(nn.Module):
     def __init__(self, config: ARTConfig):
         super().__init__()
-        self.config = config
-        self.dim_model = config.dim_model
-        
         self.layers = nn.ModuleList([
             ARTDecoderLayer(config, layer_idx=i) for i in range(config.n_decoder_layers)
         ])
-        self.norm = nn.LayerNorm(self.dim_model)
+        self.norm = nn.LayerNorm(config.dim_model)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        cache: Optional[transformers.Cache] = None,
-        attn_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> torch.Tensor:
-        
+    def forward(self, x, attn_mask=None, cache=None, attn_kwargs=None):
         for layer in self.layers:
-            x = layer(
-                x,
-                attention_mask=attn_mask,
-                cache=cache,
-                attn_kwargs=attn_kwargs
-            )
-            
+            x = layer(x, attention_mask=attn_mask, cache=cache, attn_kwargs=attn_kwargs)
         x = self.norm(x)
         return x
 
@@ -559,6 +488,7 @@ class ARTDecoder(nn.Module):
 class ARTDecoderLayer(nn.Module):
     def __init__(self, config: ARTConfig, layer_idx: int):
         super().__init__()
+        # Shared Attention Class
         self.self_attn = ARTMaskAttention(config, layer_idx=layer_idx)
         
         self.norm1 = nn.LayerNorm(config.dim_model)
@@ -580,7 +510,7 @@ class ARTDecoderLayer(nn.Module):
         residual = x
         x = self.norm1(x)
         
-        # Pass kwargs (including position indices and cache settings) to attention
+        # Shared Attention Logic
         x = self.self_attn(
             x, 
             attn_mask=attention_mask, 
@@ -599,7 +529,10 @@ class ARTDecoderLayer(nn.Module):
 
 class ARTMaskAttention(nn.Module):
     """
-    Causal Self-Attention with RoPE and explicit KV Cache control.
+    Unified Attention Block.
+    - If attn_kwargs is None (Encoder): Standard Self-Attention, No RoPE.
+    - If attn_kwargs is Set (Decoder): RoPE + Cache indexing.
+    - Expects BATCH FIRST inputs (B, L, D).
     """
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -627,19 +560,21 @@ class ARTMaskAttention(nn.Module):
         attn_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         
+        # 1. Input is [B, L, D] (Batch First)
         bsz, q_len, _ = hidden_states.size()
 
-        # 1. Project
+        # 2. Project
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # 2. Reshape
+        # 3. Reshape for SDPA: [B, H, L, D]
+        # view: [B, L, H, D] -> transpose: [B, H, L, D]
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 3. RoPE
+        # 4. RoPE (Only if kwargs provided)
         if attn_kwargs is not None:
             q_pos_ids = attn_kwargs.get('query_position_indices')
             k_pos_ids = attn_kwargs.get('key_position_indices')
@@ -655,241 +590,82 @@ class ARTMaskAttention(nn.Module):
                     cos_k, sin_k = self.rotary_emb(k_pos_ids, device=key_states.device, dtype=key_states.dtype)
                     key_states = apply_rotary_pos_emb(key_states, cos_k, sin_k)
 
-        # 4. Cache
+        # 5. Cache
         if cache is not None:
-            # Extract specific cache_kwargs if provided (e.g. for StaticCache indexing)
             cache_args = attn_kwargs.get('cache_kwargs', {}) if attn_kwargs else {}
-            
-            # print k,v shapes before update
-            print(f"Before Cache Update - Key shape: {key_states.shape}, Value shape: {value_states.shape}")
-            
+            # Update cache and get FULL sequence
             key_states, value_states = cache.update(
                 key_states, value_states, self.layer_idx, cache_kwargs=cache_args
             )
 
-        # 5. Attention
+        # 6. Attention
         attn_output = F.scaled_dot_product_attention(
             query_states, key_states, value_states, 
             attn_mask=attn_mask, 
             dropout_p=self.config.dropout if self.training else 0.0
         )
 
+        # 7. Reshape Back: [B, L, D]
+        # transpose: [B, L, H, D] -> view: [B, L, H*D]
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
+        
         return self.out_proj(attn_output)
+
 
 class RotaryPositionalEncoding(nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
         self.dim = dim
         self.base = base
-        # Pre-compute theta (1/frequency)
-        # We register this as a buffer so it saves with state_dict and moves to device automatically
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    @torch.no_grad() # CRITICAL: No gradients needed for position calc
-    def forward(self, position_ids: torch.LongTensor, device=None, dtype=None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculates Cos and Sin embeddings for the given position IDs.
-        
-        Args:
-            position_ids: [Batch, Seq_Len] or [1, Seq_Len]
-            device: Target device (optional, usually inferred from inputs in higher layers)
-            dtype: Target dtype (optional)
-        """
-        # 1. Use the device of the buffer (which tracks the model device)
-        if device is None:
-            device = self.inv_freq.device
-            
-        # 2. Expand frequencies to match batch size
-        # inv_freq: [Dim/2] -> [1, 1, Dim/2]
+    @torch.no_grad()
+    def forward(self, position_ids, device=None, dtype=None):
+        if device is None: device = self.inv_freq.device
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        
-        # 3. Expand position IDs
-        # position_ids: [Batch, Seq] -> [Batch, Seq, 1]
         position_ids_expanded = position_ids[:, None, :].float()
-        
-        # 4. Matrix Mult: Outer product of Positions and Frequencies
-        # Result: [Batch, Seq, Dim/2]
-        # We force float32 here for numerical stability during the rotation calc
         with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos()
             sin = emb.sin()
-            
-        # 5. Cast to target dtype (e.g., bfloat16) only at the end
-        if dtype is not None:
-            return cos.to(dtype=dtype), sin.to(dtype=dtype)
+        if dtype is not None: return cos.to(dtype=dtype), sin.to(dtype=dtype)
         return cos, sin
 
 def apply_rotary_pos_emb(x, cos, sin):
-    """
-    Applies the computed Cos/Sin to query or key `x`.
-    x: [Batch, Heads, Seq_Len, Head_Dim]
-    cos, sin: [Batch, 1, Seq_Len, Head_Dim]
-    """
     def rotate_half(x):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
-
-    # Ensure broadcasting dimensions match (Batch, 1, Seq, Dim)
-    # This handles the case where cos/sin output is [B, S, D]
-    if cos.ndim == 3:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    
+    if cos.ndim == 3: cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
     return (x * cos) + (rotate_half(x) * sin)
 
+def get_activation_fn(activation: str) -> Callable:
+    if activation == "relu": return F.relu
+    if activation == "gelu": return F.gelu
+    if activation == "glu": return F.glu
+    raise RuntimeError(f"activation should be relu/gelu/glu, not {activation}.")
 
-
-def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:
-    """1D sinusoidal positional embeddings as in Attention is All You Need.
-
-    Args:
-        num_positions: Number of token positions required.
-    Returns: (num_positions, dimension) position embeddings (the first dimension is the batch dimension).
-
-    """
-
-    def get_position_angle_vec(position):
-        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
-
-    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
-    return torch.from_numpy(sinusoid_table).float()
-
-
+# Keep existing embedding utils
 class ACTSinusoidalPositionEmbedding2d(nn.Module):
-    """2D sinusoidal positional embeddings similar to what's presented in Attention Is All You Need.
-
-    The variation is that the position indices are normalized in [0, 2π] (not quite: the lower bound is 1/H
-    for the vertical direction, and 1/W for the horizontal direction.
-    """
-
     def __init__(self, dimension: int):
-        """
-        Args:
-            dimension: The desired dimension of the embeddings.
-        """
         super().__init__()
         self.dimension = dimension
         self._two_pi = 2 * math.pi
         self._eps = 1e-6
-        # Inverse "common ratio" for the geometric progression in sinusoid frequencies.
         self._temperature = 10000
 
     def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: A (B, C, H, W) batch of 2D feature map to generate the embeddings for.
-        Returns:
-            A (1, C, H, W) batch of corresponding sinusoidal positional embeddings.
-        """
-        not_mask = torch.ones_like(x[0, :1])  # (1, H, W)
-        # Note: These are like range(1, H+1) and range(1, W+1) respectively, but in most implementations
-        # they would be range(0, H) and range(0, W). Keeping it at as is to match the original code.
+        not_mask = torch.ones_like(x[0, :1])
         y_range = not_mask.cumsum(1, dtype=torch.float32)
         x_range = not_mask.cumsum(2, dtype=torch.float32)
-
-        # "Normalize" the position index such that it ranges in [0, 2π].
-        # Note: Adding epsilon on the denominator should not be needed as all values of y_embed and x_range
-        # are non-zero by construction. This is an artifact of the original code.
         y_range = y_range / (y_range[:, -1:, :] + self._eps) * self._two_pi
         x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
-
-        inverse_frequency = self._temperature ** (
-            2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension
-        )
-
-        x_range = x_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
-        y_range = y_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
-
-        # Note: this stack then flatten operation results in interleaved sine and cosine terms.
-        # pos_embed_x and pos_embed_y are (1, H, W, C // 2).
+        inverse_frequency = self._temperature ** (2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension)
+        x_range = x_range.unsqueeze(-1) / inverse_frequency
+        y_range = y_range.unsqueeze(-1) / inverse_frequency
         pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
         pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
-        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
-
+        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)
         return pos_embed
-
-
-def get_activation_fn(activation: str) -> Callable:
-    """Return an activation function given a string."""
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(f"activation should be relu/gelu/glu, not {activation}.")
-
-class ARTEncoderAttention(nn.Module):
-    """
-    Decomposed MultiHeadAttention for the Encoder to support KV Caching.
-    Does NOT use RoPE. Uses standard absolute position embeddings passed via Q/K inputs.
-    """
-    def __init__(self, config: ARTConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.embed_dim = config.dim_model
-        self.num_heads = config.n_heads
-        self.head_dim = self.embed_dim // self.num_heads
-        self.layer_idx = layer_idx 
-        
-        if (self.head_dim * self.num_heads) != self.embed_dim:
-            raise ValueError(f"embed_dim must be divisible by num_heads (got {self.embed_dim} and {self.num_heads})")
-
-        # Projections
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
-
-    def forward(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        key_padding_mask: Tensor | None = None,
-        past_key_value: transformers.Cache | None = None, 
-    ) -> Tensor:
-        # Input shape: (Seq_Len, Batch, Dim) - adhering to original ACT convention
-        tgt_len, bsz, _ = query.shape
-        src_len = key.shape[0]
-
-        # 1. Project
-        q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
-
-        # 2. Reshape to (Batch, Heads, Seq_Len, Head_Dim) for Cache & SDPA
-        # Transpose (Seq, Batch, Dim) -> (Batch, Seq, Dim) first
-        q = q.transpose(0, 1).view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.transpose(0, 1).view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.transpose(0, 1).view(bsz, src_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # 3. Update Cache (The main reason we are doing this)
-        # Note: The encoder typically processes the whole prefix at once, so we store the full K/V.
-        if past_key_value is not None:
-            # We don't usually need cache_position for the encoder as it's not autoregressive,
-            # but DynamicCache expects the call.
-            k, v = past_key_value.update(k, v, self.layer_idx)
-
-        # 4. Attention
-        # Standard scaled dot product attention
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=key_padding_mask, # Note: PyTorch SDPA handles broadcasting for mask
-            dropout_p=self.config.dropout if self.training else 0.0
-        )
-
-        # 5. Reshape back to (Seq_Len, Batch, Dim)
-        # (Batch, Heads, Seq, Head_Dim) -> (Batch, Seq, Dim) -> (Seq, Batch, Dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, tgt_len, self.embed_dim)
-        attn_output = attn_output.transpose(0, 1)
-
-        # 6. Output Projection
-        return self.out_proj(attn_output)

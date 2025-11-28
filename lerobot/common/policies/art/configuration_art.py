@@ -119,7 +119,7 @@ class ARTConfig(PreTrainedConfig):
     # Note: Although the original ACT implementation has 7 for `n_decoder_layers`, there is a bug in the code
     # that means only the first layer is used. Here we match the original implementation by setting this to 1.
     # See this issue https://github.com/tonyzhaozh/act/issues/25#issue-2258740521.
-    n_decoder_layers: int = 2
+    n_decoder_layers: int = 4 # in art, as we are using kv cache, we need decoder layers <= encoder layers, better set equal
     # VAE.
     use_vae: bool = False
     latent_dim: int = 32
