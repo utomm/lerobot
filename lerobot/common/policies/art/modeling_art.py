@@ -23,6 +23,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from typing import Any, Dict, cast, Optional, Tuple
 
 import einops
 import numpy as np
@@ -140,54 +141,24 @@ class ARTPolicy(PreTrainedPolicy):
                 [batch[key] for key in self.config.image_features], dim=-4
             )
         batch = self.normalize_targets(batch)
-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
+        actions_hat = self.model(batch)
 
         l1_loss = (
             F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
 
-        loss_dict = {"l1_loss": l1_loss.item()}
+        loss_dict = {"l1_loss": l1_loss.item(), "loss": l1_loss}
         
-        loss_dict["loss"] = l1_loss
+        # loss_dict["loss"] = l1_loss
 
         # loss = l1_loss
 
         return loss_dict
 
 class ART(nn.Module):
-    """Action Chunking Transformer: The underlying neural network for ACTPolicy.
-
-    Note: In this code we use the terms `vae_encoder`, 'encoder', `decoder`. The meanings are as follows.
-        - The `vae_encoder` is, as per the literature around variational auto-encoders (VAE), the part of the
-          model that encodes the target data (a sequence of actions), and the condition (the robot
-          joint-space).
-        - A transformer with an `encoder` (not the VAE encoder) and `decoder` (not the VAE decoder) with
-          cross-attention is used as the VAE decoder. For these terms, we drop the `vae_` prefix because we
-          have an option to train this model without the variational objective (in which case we drop the
-          `vae_encoder` altogether, and nothing about this model has anything to do with a VAE).
-
-                                 Transformer
-                                 Used alone for inference
-                                 (acts as VAE decoder
-                                  during training)
-                                ┌───────────────────────┐
-                                │             Outputs   │
-                                │                ▲      │
-                                │     ┌─────►┌───────┐  │
-                   ┌──────┐     │     │      │Transf.│  │
-                   │      │     │     ├─────►│decoder│  │
-              ┌────┴────┐ │     │     │      │       │  │
-              │         │ │     │ ┌───┴───┬─►│       │  │
-              │ VAE     │ │     │ │       │  └───────┘  │
-              │ encoder │ │     │ │Transf.│             │
-              │         │ │     │ │encoder│             │
-              └───▲─────┘ │     │ │       │             │
-                  │       │     │ └▲──▲─▲─┘             │
-                  │       │     │  │  │ │               │
-                inputs    └─────┼──┘  │ image emb.      │
-                                │    state emb.         │
-                                └───────────────────────┘
-    """
+    """ modified Action Chunking Transformer model, now with AR decoder and pizero style kv sharing.
+    cache the kv features from vision encoder for use in decoder.
+    deocder maintains its own cache for history states."""
 
     def __init__(self, config: ARTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
@@ -210,12 +181,12 @@ class ART(nn.Module):
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ARTEncoder(config)
-        self.decoder = ACTDecoder(config)
+        self.decoder = ARTDecoder(config)
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
         if self.config.robot_state_feature:
-            self.encoder_robot_state_input_proj = nn.Linear(
+            self.state_input_proj = nn.Linear(
                 self.config.robot_state_feature.shape[0], config.dim_model
             )
         if self.config.env_state_feature:
@@ -252,106 +223,218 @@ class ART(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
+    # def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+    #     """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
 
-        `batch` should have the following structure:
-        {
-            [robot_state_feature] (optional): (B, state_dim) batch of robot states.
+    #     `batch` should have the following structure:
+    #     {
+    #         [robot_state_feature] (optional): (B, state_dim) batch of robot states.
 
-            [image_features]: (B, n_cameras, C, H, W) batch of images.
-                AND/OR
-            [env_state_feature]: (B, env_dim) batch of environment states.
+    #         [image_features]: (B, n_cameras, C, H, W) batch of images.
+    #             AND/OR
+    #         [env_state_feature]: (B, env_dim) batch of environment states.
 
-            [action_feature] (optional, only if training with VAE): (B, chunk_size, action dim) batch of actions.
-        }
+    #         [action_feature] (optional, only if training with VAE): (B, chunk_size, action dim) batch of actions.
+    #     }
 
-        Returns:
-            (B, chunk_size, action_dim) batch of action sequences
-            Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
-            latent dimension.
+    #     Returns:
+    #         (B, chunk_size, action_dim) batch of action sequences
+    #         Tuple containing the latent PDF's parameters (mean, log(σ²)) both as (B, L) tensors where L is the
+    #         latent dimension.
+    #     """
+    #     if self.config.use_vae and self.training:
+    #         assert (
+    #             "action" in batch
+    #         ), "actions must be provided when using the variational objective in training mode."
+
+    #     batch_size = (
+    #         batch["observation.images"]
+    #         if "observation.images" in batch
+    #         else batch["observation.environment_state"]
+    #     ).shape[0]
+        
+    #     # print everything in the batch, with shape info
+    #     # for k, v in batch.items():
+    #     #     print(f"batch[{k}]: shape={v.shape}, dtype={v.dtype}, device={v.device}")
+
+
+    #     # Prepare the latent for input to the transformer encoder.
+
+    #         # When not using the VAE encoder, we set the latent to be all zeros.
+    #     mu = log_sigma_x2 = None
+    #     # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
+    #     latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+    #         batch["observation.state"].device
+    #     )
+
+    #     # Prepare transformer encoder inputs.
+    #     encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+    #     encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+    #     # Robot state token.
+    #     # if self.config.robot_state_feature:
+    #     #     encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
+    #     # Environment state token.
+    #     if self.config.env_state_feature:
+    #         encoder_in_tokens.append(
+    #             self.encoder_env_state_input_proj(batch["observation.environment_state"])
+    #         )
+
+    #     # Camera observation features and positional embeddings.
+    #     if self.config.image_features:
+    #         all_cam_features = []
+    #         all_cam_pos_embeds = []
+
+    #         for cam_index in range(batch["observation.images"].shape[-4]):
+    #             cam_features = self.backbone(batch["observation.images"][:, cam_index])["feature_map"]
+    #             # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use
+    #             # buffer
+    #             cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+    #             cam_features = self.encoder_img_feat_input_proj(cam_features)  # (B, C, h, w)
+    #             all_cam_features.append(cam_features)
+    #             all_cam_pos_embeds.append(cam_pos_embed)
+    #         # Concatenate camera observation feature maps and positional embeddings along the width dimension,
+    #         # and move to (sequence, batch, dim).
+    #         all_cam_features = torch.cat(all_cam_features, axis=-1)
+    #         encoder_in_tokens.extend(einops.rearrange(all_cam_features, "b c h w -> (h w) b c"))
+    #         all_cam_pos_embeds = torch.cat(all_cam_pos_embeds, axis=-1)
+    #         encoder_in_pos_embed.extend(einops.rearrange(all_cam_pos_embeds, "b c h w -> (h w) b c"))
+
+    #     # Stack all tokens along the sequence dimension.
+    #     encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
+    #     encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        
+    #     cache = transformers.DynamicCache()  # Initialize empty cache for KV caching
+
+    #     # Forward pass through the transformer modules.
+    #     encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, past_key_value=cache)
+    #     # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+    #     decoder_in = torch.zeros(
+    #         (self.config.chunk_size, batch_size, self.config.dim_model),
+    #         dtype=encoder_in_pos_embed.dtype,
+    #         device=encoder_in_pos_embed.device,
+    #     )
+    #     decoder_in[:] = self.encoder_robot_state_input_proj(batch["observation.state"])
+    #     decoder_out = self.decoder(
+    #         decoder_in,
+    #         encoder_out,
+    #         encoder_pos_embed=encoder_in_pos_embed,
+    #         decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+    #     )
+
+    #     # Move back to (B, S, C).
+    #     decoder_out = decoder_out.transpose(0, 1)
+
+    #     actions = self.action_head(decoder_out)
+
+    #     return actions, (mu, log_sigma_x2)
+
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """
-        if self.config.use_vae and self.training:
-            assert (
-                "action" in batch
-            ), "actions must be provided when using the variational objective in training mode."
-
-        batch_size = (
-            batch["observation.images"]
-            if "observation.images" in batch
-            else batch["observation.environment_state"]
-        ).shape[0]
-
-        # Prepare the latent for input to the transformer encoder.
-
-            # When not using the VAE encoder, we set the latent to be all zeros.
-        mu = log_sigma_x2 = None
-        # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-        latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-            batch["observation.state"].device
-        )
-
-        # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
-        # Robot state token.
-        # if self.config.robot_state_feature:
-        #     encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch["observation.state"]))
-        # Environment state token.
-        if self.config.env_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_env_state_input_proj(batch["observation.environment_state"])
-            )
-
-        # Camera observation features and positional embeddings.
+        Training Forward:
+        1. VLM Prefix -> Cache (Pos 0)
+        2. States (History + Future) -> Decoder[hist:hist + future] -> Future Actions
+        """
+        
+        # 1. Vision Encoder (Prefix)
+        encoder_in_tokens = []
         if self.config.image_features:
             all_cam_features = []
-            all_cam_pos_embeds = []
-
             for cam_index in range(batch["observation.images"].shape[-4]):
-                cam_features = self.backbone(batch["observation.images"][:, cam_index])["feature_map"]
-                # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use
-                # buffer
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
-                cam_features = self.encoder_img_feat_input_proj(cam_features)  # (B, C, h, w)
-                all_cam_features.append(cam_features)
-                all_cam_pos_embeds.append(cam_pos_embed)
-            # Concatenate camera observation feature maps and positional embeddings along the width dimension,
-            # and move to (sequence, batch, dim).
-            all_cam_features = torch.cat(all_cam_features, axis=-1)
-            encoder_in_tokens.extend(einops.rearrange(all_cam_features, "b c h w -> (h w) b c"))
-            all_cam_pos_embeds = torch.cat(all_cam_pos_embeds, axis=-1)
-            encoder_in_pos_embed.extend(einops.rearrange(all_cam_pos_embeds, "b c h w -> (h w) b c"))
+                img = batch["observation.images"][:, cam_index]
+                feat = self.backbone(img)["feature_map"]
+                feat = self.encoder_img_feat_input_proj(feat)
+                pos = self.encoder_cam_feat_pos_embed(feat).to(dtype=feat.dtype)
+                feat = feat + pos
+                all_cam_features.append(feat)
+            
+            all_cam_features = torch.cat(all_cam_features, dim=-1)
+            encoder_in_tokens.append(einops.rearrange(all_cam_features, "b c h w -> b (h w) c"))
 
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        encoder_in = torch.cat(encoder_in_tokens, dim=1)
         
-        cache = transformers.DynamicCache()  # Initialize empty cache for KV caching
+        # Populate Cache (Prefix)
+        cache = transformers.DynamicCache()
+        _ = self.encoder(encoder_in, past_key_value=cache)
+        prefix_len = cache[0][0].shape[-2]
+        
+        # print cache shapes, 2nd dim is 0,1 for k,v
+        for i, layer_cache in enumerate(cache):
+            print(f"Layer {i}:")
+            print(f"  Key shape: {layer_cache[0].shape}")
+            print(f"  Value shape: {layer_cache[1].shape}")
 
-        # Forward pass through the transformer modules.
-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, past_key_value=cache)
-        # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
-        decoder_in = torch.zeros(
-            (self.config.chunk_size, batch_size, self.config.dim_model),
-            dtype=encoder_in_pos_embed.dtype,
-            device=encoder_in_pos_embed.device,
+        # 2. State Projection (History + Future combined)
+        # We don't slice history/future separately; we treat it as one sequence.
+        all_states = batch["observation.state"] # [B, Seq_Len, Dim]
+        decoder_input = self.state_input_proj(all_states)
+        
+        batch_size, seq_len, _ = decoder_input.shape
+        device = decoder_input.device
+        hist_len = self.config.history_length
+        
+        assert seq_len == hist_len + self.config.chunk_size, ValueError(
+            f"Sequence length {seq_len} does not match history {hist_len} + chunk size {self.config.chunk_size}"
         )
-        decoder_in[:] = self.encoder_robot_state_input_proj(batch["observation.state"])
+
+        # 3. Construct RoPE Positions
+        # Sequence indices: [0, 1, 2, ... L]
+        # Shift by history: [-H, -H+1, ... -1, 0, 1 ... F]
+        position_ids = torch.arange(seq_len, device=device) - hist_len
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+
+        # 4. Build Mask
+        # Rules:
+        # - Indices < 0 (History): Cannot see Prefix. Causal Self.
+        # - Indices >= 0 (Future): See Prefix. Causal Self.
+        mask = self._build_pizero_mask(batch_size, prefix_len, hist_len, seq_len, device)
+
+        # 5. Run Decoder
+        # DynamicCache automatically appends to the end, so we don't strictly need cache_position for training
+        # unless we were doing something non-contiguous.
         decoder_out = self.decoder(
-            decoder_in,
-            encoder_out,
-            encoder_pos_embed=encoder_in_pos_embed,
-            decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            decoder_input,
+            attn_mask=mask,
+            cache=cache,
+            attn_kwargs={
+                'query_position_indices': position_ids,
+                'key_position_indices': position_ids,
+                'cache_kwargs': {'cache_position': None} # Default: Append to end
+            }
         )
 
-        # Move back to (B, S, C).
-        decoder_out = decoder_out.transpose(0, 1)
-
-        actions = self.action_head(decoder_out)
-
-        return actions, (mu, log_sigma_x2)
-
+        # 6. Extract Future (Indices corresponding to >= 0)
+        future_out = decoder_out[:, hist_len:]
+        
+        return self.action_head(future_out), {}
+    
+    def _build_pizero_mask(self, batch_size, prefix_len, hist_len, seq_len, device):
+        """
+        Masking Logic:
+        Q: [Seq_Len] (History + Future)
+        K: [Prefix + Seq_Len]
+        """
+        k_len = prefix_len + seq_len
+        mask = torch.zeros(batch_size, 1, seq_len, k_len, dtype=torch.bool, device=device)
+        
+        # Slices
+        c_prefix = slice(0, prefix_len)
+        c_seq = slice(prefix_len, k_len) # The AR part of Keys
+        
+        r_future = slice(hist_len, seq_len)
+        
+        # 1. Causal Self-Attention for the whole sequence
+        # This handles History->History and Future->Future and Future->History
+        causal = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        mask[:, :, :, c_seq] = causal
+        
+        # 2. Handle Vision Prefix Visibility
+        # History (r_hist) -> Prefix: BLOCKED (False) -> Default is False, so do nothing.
+        # Future (r_future) -> Prefix: VISIBLE (True)
+        if prefix_len > 0:
+            mask[:, :, r_future, c_prefix] = True
+            
+        return mask
+    
 class ARTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
@@ -442,99 +525,223 @@ class ARTEncoderLayer(nn.Module):
             x = self.norm2(x)
         return x
 
-class ACTDecoder(nn.Module):
+class ARTDecoder(nn.Module):
     def __init__(self, config: ARTConfig):
-        """Convenience module for running multiple decoder layers followed by normalization."""
         super().__init__()
-        self.layers = nn.ModuleList([ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
-        self.norm = nn.LayerNorm(config.dim_model)
+        self.config = config
+        self.dim_model = config.dim_model
+        
+        self.layers = nn.ModuleList([
+            ARTDecoderLayer(config, layer_idx=i) for i in range(config.n_decoder_layers)
+        ])
+        self.norm = nn.LayerNorm(self.dim_model)
 
     def forward(
         self,
-        x: Tensor,
-        encoder_out: Tensor,
-        decoder_pos_embed: Tensor | None = None,
-        encoder_pos_embed: Tensor | None = None,
-    ) -> Tensor:
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cache: Optional[transformers.Cache] = None,
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        
         for layer in self.layers:
             x = layer(
-                x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed
+                x,
+                attention_mask=attn_mask,
+                cache=cache,
+                attn_kwargs=attn_kwargs
             )
-        if self.norm is not None:
-            x = self.norm(x)
+            
+        x = self.norm(x)
         return x
 
 
-class ACTDecoderLayer(nn.Module):
-    def __init__(self, config: ARTConfig):
+class ARTDecoderLayer(nn.Module):
+    def __init__(self, config: ARTConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
-        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
-
-        # Feed forward layers.
-        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
-        self.dropout = nn.Dropout(config.dropout)
-        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
-
+        self.self_attn = ARTMaskAttention(config, layer_idx=layer_idx)
+        
         self.norm1 = nn.LayerNorm(config.dim_model)
         self.norm2 = nn.LayerNorm(config.dim_model)
-        self.norm3 = nn.LayerNorm(config.dim_model)
-        self.dropout1 = nn.Dropout(config.dropout)
-        self.dropout2 = nn.Dropout(config.dropout)
-        self.dropout3 = nn.Dropout(config.dropout)
-
+        
+        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
+        self.dropout = nn.Dropout(config.dropout)
         self.activation = get_activation_fn(config.feedforward_activation)
-        self.pre_norm = config.pre_norm
-
-    def maybe_add_pos_embed(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
-        return tensor if pos_embed is None else tensor + pos_embed
 
     def forward(
         self,
-        x: Tensor,
-        encoder_out: Tensor,
-        decoder_pos_embed: Tensor | None = None,
-        encoder_pos_embed: Tensor | None = None,
-    ) -> Tensor:
-        """
-        Args:
-            x: (Decoder Sequence, Batch, Channel) tensor of input tokens.
-            encoder_out: (Encoder Sequence, B, C) output features from the last layer of the encoder we are
-                cross-attending with.
-            encoder_pos_embed: (ES, 1, C) positional embedding for keys (from the encoder).
-            decoder_pos_embed: (DS, 1, C) positional embedding for the queries (from the decoder).
-        Returns:
-            (DS, B, C) tensor of decoder output features.
-        """
-        skip = x
-        if self.pre_norm:
-            x = self.norm1(x)
-        q = k = self.maybe_add_pos_embed(x, decoder_pos_embed)
-        x = self.self_attn(q, k, value=x)[0]  # select just the output, not the attention weights
-        x = skip + self.dropout1(x)
-        if self.pre_norm:
-            skip = x
-            x = self.norm2(x)
-        else:
-            x = self.norm1(x)
-            skip = x
-        x = self.multihead_attn(
-            query=self.maybe_add_pos_embed(x, decoder_pos_embed),
-            key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
-            value=encoder_out,
-        )[0]  # select just the output, not the attention weights
-        x = skip + self.dropout2(x)
-        if self.pre_norm:
-            skip = x
-            x = self.norm3(x)
-        else:
-            x = self.norm2(x)
-            skip = x
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        cache: Optional[transformers.Cache] = None,
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        
+        residual = x
+        x = self.norm1(x)
+        
+        # Pass kwargs (including position indices and cache settings) to attention
+        x = self.self_attn(
+            x, 
+            attn_mask=attention_mask, 
+            cache=cache, 
+            attn_kwargs=attn_kwargs
+        )
+        x = residual + self.dropout(x)
+
+        residual = x
+        x = self.norm2(x)
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = skip + self.dropout3(x)
-        if not self.pre_norm:
-            x = self.norm3(x)
+        x = residual + self.dropout(x)
+        
         return x
+
+
+class ARTMaskAttention(nn.Module):
+    """
+    Causal Self-Attention with RoPE and explicit KV Cache control.
+    """
+    def __init__(self, config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.dim_model
+        self.num_heads = config.n_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.layer_idx = layer_idx
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError("hidden_size must be divisible by num_heads")
+
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        
+        self.rotary_emb = RotaryPositionalEncoding(self.head_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cache: Optional[transformers.Cache] = None,
+        attn_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        
+        bsz, q_len, _ = hidden_states.size()
+
+        # 1. Project
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # 2. Reshape
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 3. RoPE
+        if attn_kwargs is not None:
+            q_pos_ids = attn_kwargs.get('query_position_indices')
+            k_pos_ids = attn_kwargs.get('key_position_indices')
+            
+            if q_pos_ids is not None:
+                cos_q, sin_q = self.rotary_emb(q_pos_ids, device=query_states.device, dtype=query_states.dtype)
+                query_states = apply_rotary_pos_emb(query_states, cos_q, sin_q)
+            
+            if k_pos_ids is not None:
+                if q_pos_ids is not None and torch.equal(q_pos_ids, k_pos_ids):
+                    key_states = apply_rotary_pos_emb(key_states, cos_q, sin_q)
+                else:
+                    cos_k, sin_k = self.rotary_emb(k_pos_ids, device=key_states.device, dtype=key_states.dtype)
+                    key_states = apply_rotary_pos_emb(key_states, cos_k, sin_k)
+
+        # 4. Cache
+        if cache is not None:
+            # Extract specific cache_kwargs if provided (e.g. for StaticCache indexing)
+            cache_args = attn_kwargs.get('cache_kwargs', {}) if attn_kwargs else {}
+            
+            # print k,v shapes before update
+            print(f"Before Cache Update - Key shape: {key_states.shape}, Value shape: {value_states.shape}")
+            
+            key_states, value_states = cache.update(
+                key_states, value_states, self.layer_idx, cache_kwargs=cache_args
+            )
+
+        # 5. Attention
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, 
+            attn_mask=attn_mask, 
+            dropout_p=self.config.dropout if self.training else 0.0
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
+        return self.out_proj(attn_output)
+
+class RotaryPositionalEncoding(nn.Module):
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        # Pre-compute theta (1/frequency)
+        # We register this as a buffer so it saves with state_dict and moves to device automatically
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad() # CRITICAL: No gradients needed for position calc
+    def forward(self, position_ids: torch.LongTensor, device=None, dtype=None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculates Cos and Sin embeddings for the given position IDs.
+        
+        Args:
+            position_ids: [Batch, Seq_Len] or [1, Seq_Len]
+            device: Target device (optional, usually inferred from inputs in higher layers)
+            dtype: Target dtype (optional)
+        """
+        # 1. Use the device of the buffer (which tracks the model device)
+        if device is None:
+            device = self.inv_freq.device
+            
+        # 2. Expand frequencies to match batch size
+        # inv_freq: [Dim/2] -> [1, 1, Dim/2]
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        
+        # 3. Expand position IDs
+        # position_ids: [Batch, Seq] -> [Batch, Seq, 1]
+        position_ids_expanded = position_ids[:, None, :].float()
+        
+        # 4. Matrix Mult: Outer product of Positions and Frequencies
+        # Result: [Batch, Seq, Dim/2]
+        # We force float32 here for numerical stability during the rotation calc
+        with torch.autocast(device_type=device.type if device.type != 'mps' else 'cpu', enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+            
+        # 5. Cast to target dtype (e.g., bfloat16) only at the end
+        if dtype is not None:
+            return cos.to(dtype=dtype), sin.to(dtype=dtype)
+        return cos, sin
+
+def apply_rotary_pos_emb(x, cos, sin):
+    """
+    Applies the computed Cos/Sin to query or key `x`.
+    x: [Batch, Heads, Seq_Len, Head_Dim]
+    cos, sin: [Batch, 1, Seq_Len, Head_Dim]
+    """
+    def rotate_half(x):
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    # Ensure broadcasting dimensions match (Batch, 1, Seq, Dim)
+    # This handles the case where cos/sin output is [B, S, D]
+    if cos.ndim == 3:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    
+    return (x * cos) + (rotate_half(x) * sin)
+
 
 
 def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:

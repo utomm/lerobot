@@ -50,6 +50,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
     @abc.abstractproperty
     def observation_delta_indices(self) -> list | None:
         raise NotImplementedError
+    
+    @property
+    def image_delta_indices(self) -> list | None:
+        return None # only used in art, for others return None
 
     @abc.abstractproperty
     def action_delta_indices(self) -> list | None:

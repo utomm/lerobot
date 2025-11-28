@@ -92,6 +92,7 @@ class ARTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
+    history_length: int = 100
     chunk_size: int = 100
     n_action_steps: int = 100
 
@@ -174,12 +175,16 @@ class ARTConfig(PreTrainedConfig):
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
 
     @property
-    def observation_delta_indices(self) -> None:
-        return None
+    def observation_delta_indices(self) -> list:
+        return list(range(-self.history_length, self.chunk_size))
 
     @property
     def action_delta_indices(self) -> list:
         return list(range(self.chunk_size))
+    
+    @property
+    def image_delta_indices(self) -> None:
+        return None
 
     @property
     def reward_delta_indices(self) -> None:
