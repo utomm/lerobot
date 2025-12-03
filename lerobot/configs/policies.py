@@ -144,4 +144,75 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # HACK: this is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
-        return draccus.parse(cls, config_file, args=cli_overrides)
+        
+        # Ensure we have a config file
+        if config_file is None:
+            raise ValueError(f"No config.json found for {pretrained_name_or_path}")
+        
+        # Try to parse normally first (works for configs with proper choice type)
+        try:
+            return draccus.parse(cls, config_file, args=cli_overrides)
+        except draccus.utils.ParsingError as e:
+            if "Expected a dict with a 'type' key" not in str(e):
+                raise  # Re-raise if it's a different parsing error
+                
+            # Handle legacy configs without type key by inferring the policy type
+            import json
+            with open(config_file) as f:
+                config_data = json.load(f)
+            
+            # Infer policy type from config structure
+            policy_type = cls._infer_policy_type(config_data)
+            
+            # Import specific config class and parse with it
+            if policy_type == "act":
+                from lerobot.common.policies.act.configuration_act import ACTConfig
+                specific_cls = ACTConfig
+            elif policy_type == "diffusion":
+                from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+                specific_cls = DiffusionConfig
+            elif policy_type == "vqbet":
+                from lerobot.common.policies.vqbet.configuration_vqbet import VQBeTConfig
+                specific_cls = VQBeTConfig
+            elif policy_type == "tdmpc":
+                from lerobot.common.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+                specific_cls = TDMPCConfig
+            elif policy_type == "art":
+                from lerobot.common.policies.art.configuration_art import ARTConfig
+                specific_cls = ARTConfig
+            else:
+                raise ValueError(f"Cannot infer policy type from config: {config_data}")
+                
+            # Parse with the specific class and cast to expected type
+            result = draccus.parse(specific_cls, config_file, args=cli_overrides)
+            return result  # type: ignore
+
+    @classmethod
+    def _infer_policy_type(cls, config_data: dict) -> str:
+        """Infer the policy type from config data structure."""
+        # Check for distinctive ACT features
+        if ("chunk_size" in config_data and "use_vae" in config_data and 
+            "vision_backbone" in config_data and "n_vae_encoder_layers" in config_data):
+            # Distinguish between ACT and ART by checking specific patterns
+            if config_data.get("history_length") is not None:
+                return "art"  # ART has history_length
+            else:
+                return "act"
+        
+        # Check for VQ-BeT features
+        if ("n_action_pred_token" in config_data or "action_chunk_size" in config_data or
+            "vq_beta" in config_data):
+            return "vqbet"
+        
+        # Check for Diffusion Policy features
+        if ("down_dims" in config_data or "diffusion_step_embed_dim" in config_data or
+            "num_inference_steps" in config_data):
+            return "diffusion"
+            
+        # Check for TD-MPC features
+        if ("horizon" in config_data or "mpc_horizon" in config_data or
+            "use_mpc" in config_data):
+            return "tdmpc"
+            
+        # Default fallback - try ACT as it's most commonly used
+        return "act"

@@ -18,6 +18,7 @@
 # TODO(rcadene, alexander-soare): clean this file
 """
 
+import datetime
 import logging
 import os
 import re
@@ -112,12 +113,13 @@ class Logger:
             wandb_run_id = None
             if cfg.resume:
                 wandb_run_id = get_wandb_run_id_from_filesystem(self.checkpoints_dir)
-
+            # add date and time to hour minuts to name to make it unique
+            time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
             wandb.init(
                 id=wandb_run_id,
                 project=cfg.wandb.project,
                 entity=cfg.wandb.entity,
-                name=self.job_name,
+                name=f"{self.job_name}_{time_str}",
                 notes=cfg.wandb.notes,
                 tags=cfg_to_group(cfg, return_list=True),
                 dir=self.log_dir,

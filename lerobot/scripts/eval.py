@@ -75,6 +75,9 @@ from lerobot.common.utils.utils import (
 from lerobot.configs import parser
 from lerobot.configs.eval import EvalPipelineConfig
 
+import faulthandler
+faulthandler.enable()
+
 
 def rollout(
     env: gym.vector.VectorEnv,
@@ -140,8 +143,12 @@ def rollout(
         disable=inside_slurm(),  # we dont want progress bar when we use slurm, since it clutters the logs
         leave=False,
     )
+    
+    print("max_steps:", max_steps)
     while not np.all(done):
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+        if step % 50 == 0:
+            print("step:", step)
         observation = preprocess_observation(observation)
         if return_observations:
             all_observations.append(deepcopy(observation))
@@ -262,6 +269,8 @@ def eval_policy(
 
     if return_episode_data:
         episode_data: dict | None = None
+        
+    print("starting eval loop")
 
     # we dont want progress bar when we use slurm, since it clutters the logs
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
@@ -323,6 +332,8 @@ def eval_policy(
                 assert episode_data["index"][-1] + 1 == this_episode_data["index"][0]
                 # Concatenate the episode data.
                 episode_data = {k: torch.cat([episode_data[k], this_episode_data[k]]) for k in episode_data}
+                
+        print("before video rendering")
 
         # Maybe render video for visualization.
         if max_episodes_rendered > 0 and len(ep_frames) > 0:

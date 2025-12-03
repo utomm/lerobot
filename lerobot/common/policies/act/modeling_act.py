@@ -348,6 +348,13 @@ class ACT(nn.Module):
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
+        
+        if config.crop_shape is not None:
+            self.do_crop = True
+            # Always use center crop for eval
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+        else:
+            self.do_crop = False
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
@@ -484,6 +491,9 @@ class ACT(nn.Module):
             encoder_in_tokens.append(
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
+            
+        print("do crop:", self.do_crop)
+        print("batch['observation.images'] shape:", batch["observation.images"].shape if "observation.images" in batch else "N/A")
 
         # Camera observation features and positional embeddings.
         if self.config.image_features:
@@ -491,7 +501,14 @@ class ACT(nn.Module):
             all_cam_pos_embeds = []
 
             for cam_index in range(batch["observation.images"].shape[-4]):
-                cam_features = self.backbone(batch["observation.images"][:, cam_index])["feature_map"]
+                if self.do_crop:
+                    # Always use center crop for eval.
+                    x = self.center_crop(batch["observation.images"][:, cam_index])
+                else:
+                    x = batch["observation.images"][:, cam_index]
+                    
+                print(f"Camera {cam_index} input shape after process:", x.shape)
+                cam_features = self.backbone(x)["feature_map"]
                 # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use
                 # buffer
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
@@ -508,6 +525,8 @@ class ACT(nn.Module):
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        
+        print("encoder_in_tokens shape:", encoder_in_tokens.shape)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)

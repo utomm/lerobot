@@ -92,9 +92,13 @@ class ARTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    history_length: int = 100
-    chunk_size: int = 100
-    n_action_steps: int = 100
+    history_length: int = 10
+    history_mask_prob: float = 0.0
+    chunk_size: int = 10
+    n_action_steps: int = 8
+    encode_current_state_in_prefix: bool = False
+    
+    test_time_history: int = 10
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -107,6 +111,7 @@ class ARTConfig(PreTrainedConfig):
     # Architecture.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    image_tokens: int = 300 
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
     # Transformer layers.
@@ -124,6 +129,7 @@ class ARTConfig(PreTrainedConfig):
     use_vae: bool = False
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
+    n_fast_decoder_layers: int = 1
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.

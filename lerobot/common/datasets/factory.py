@@ -48,7 +48,7 @@ def resolve_delta_timestamps(
         if key == "action" and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
-            if key.startswith("observation.images"):
+            if key.startswith("observation.image"):
                 if cfg.image_delta_indices is not None:
                     delta_timestamps[key] = [i / ds_meta.fps for i in cfg.image_delta_indices]
                 else:
