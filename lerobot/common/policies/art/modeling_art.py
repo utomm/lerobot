@@ -38,6 +38,7 @@ import transformers
 from lerobot.common.policies.art.configuration_art import ARTConfig
 from lerobot.common.policies.normalize import Normalize, Unnormalize
 from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.configs.types import NormalizationMode
 
 
 class ARTPolicy(PreTrainedPolicy):
@@ -63,6 +64,17 @@ class ARTPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
+
+
+
+        
+        if self.config.tokenize_actions:
+            # self.action_tokenizer = SpatialActionTokenizer(num_bins=self.config.action_bins)
+            self.action_tokenizer = KMeansTokenizer(centers_path=self.config.tokenizer_pth)
+            if config.action_bins is None:
+                config.action_bins = self.action_tokenizer.vocab_size
+            self.config.normalization_mapping["ACTION"] = NormalizationMode.IDENTITY
+            
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
@@ -70,7 +82,7 @@ class ARTPolicy(PreTrainedPolicy):
         self.unnormalize_outputs = Unnormalize(
             config.output_features, config.normalization_mapping, dataset_stats
         )
-
+        
         self.model = ART(config)
 
 
@@ -116,6 +128,10 @@ class ARTPolicy(PreTrainedPolicy):
         # print everything in the batch, with shape info
         # for k, v in batch.items():
         #     print(f"{k}: {v.shape}")
+        
+        if self.config.tokenize_actions and self.config.tokenize_delta_actions:
+            # need cache unnormalized current state for delta action decoding
+            cache_current_state = batch["observation.state"].clone()
 
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
@@ -130,18 +146,33 @@ class ARTPolicy(PreTrainedPolicy):
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
         # querying the policy.
-        actions = self.model.generate_next_action(batch)
+        out_dict = self.model.generate_next_action(batch)  # [B, 1, Dim]
         
-        actions = actions.squeeze(1)  # remove the sequence dim, because we only asked for one action at every eval step
+        actions = out_dict.get("action_out").squeeze(1)  # remove the sequence dim, because we only asked for one action at every eval step
 
         # TODO(rcadene): make _forward return output dictionary?
-        actions = self.unnormalize_outputs({"action": actions})["action"]
+        if self.config.tokenize_actions:
+            offset_out = out_dict.get("offset_out", None)  # [B, Dim]
+            if offset_out is not None:
+                offset_out = offset_out.squeeze(1)  # [B, Dim]
+            action_logits = actions # [B, C]
+            action_tokens = torch.argmax(action_logits, dim=-1)  # [B]
+            actions = self.action_tokenizer.decode(action_tokens)  # [B, action_dim]
+            actions = actions + (offset_out if offset_out is not None else 0)
+            if self.config.tokenize_delta_actions:
+                # need to add to current position
+                actions = actions + cache_current_state # [B, action_dim]
+        else:
+            actions = self.unnormalize_outputs({"action": actions})["action"]
 
         self.test_step_counter += 1
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run the batch through the model and compute the loss for training or validation."""
+        if self.config.tokenize_actions and self.config.tokenize_delta_actions:
+            # need cache unnormalized current state for delta action decoding
+            cache_current_state = batch["observation.state"].clone()
         batch = self.normalize_inputs(batch)
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
@@ -149,18 +180,68 @@ class ARTPolicy(PreTrainedPolicy):
                 [batch[key] for key in self.config.image_features], dim=-4
             )
         batch = self.normalize_targets(batch)
-        actions_hat, actions_fast = self.model(batch)
+        forward_dict = self.model(batch)
+        actions_hat = forward_dict["action_out"]
+        actions_fast = forward_dict["fast_out"]
+        
+        
+        if self.config.tokenize_actions:
+            gt_actions = batch["action"]
+            action_offsets = forward_dict.get("action_offsets", None)
+            
+            with torch.no_grad(): # No gradients needed for target generation
+                if self.config.tokenize_delta_actions:
+                    # need to convert to delta actions
+                    # print("gt_actions:", gt_actions)
+                    # print("batch['observation.state']:", cache_current_state[:, -self.config.chunk_size:, :])
+                    gt_actions = gt_actions - cache_current_state[:, -self.config.chunk_size:, :] # [B, Seq_Len, Dim]
+                else:
+                    gt_actions = gt_actions
+                action_gt_tokens = self.action_tokenizer(gt_actions) # Returns [B, S]
+                action_gt_offsets = gt_actions - self.action_tokenizer.decode(action_gt_tokens) # [B, S, Dim], we don't have to normalize offsets because they are small values around -1 to 1
+                
+                
+                # print("action_tokens:", action_tokens)
+            
+            ar_loss = (
+                F.cross_entropy(
+                    actions_hat.permute(0, 2, 1),  # (B, C, S)
+                    action_gt_tokens,  # (B, S)
+                    reduction="none",
+                ) * ~batch["action_is_pad"]
+            ).mean()
+            
+            fast_loss = (
+                F.cross_entropy(
+                    actions_fast.permute(0, 2, 1),  # (B, C, S)
+                    action_gt_tokens,  # (B, S)
+                    reduction="none",
+                ) * ~batch["action_is_pad"]
+            ).mean()
+            
+            if action_offsets is not None:
+                offset_loss = (
+                    F.l1_loss(
+                        action_offsets,
+                        action_gt_offsets,
+                        reduction="none"
+                    ) * ~batch["action_is_pad"].unsqueeze(-1)
+                ).mean()
+                
+            loss_dict = {"ar_loss": ar_loss.item(), "fast_loss": fast_loss.item(), "offset_loss": offset_loss.item(), "loss": ar_loss + fast_loss + offset_loss}
+        
+        else:
         
 
-        l1_loss = (
-            F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-        
-        fast_loss = (
-            F.l1_loss(batch["action"], actions_fast, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+            ar_loss = (
+                F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+            ).mean()
+            
+            fast_loss = (
+                F.l1_loss(batch["action"], actions_fast, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+            ).mean()
 
-        loss_dict = {"l1_loss": l1_loss.item(), "fast_loss": fast_loss.item(),   "loss": l1_loss + fast_loss}
+            loss_dict = {"ar_loss": ar_loss.item(), "fast_loss": fast_loss.item(),   "loss": ar_loss + fast_loss}
         
         # loss_dict["loss"] = l1_loss
 
@@ -197,7 +278,6 @@ class ART(nn.Module):
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ARTEncoder(config)
         self.decoder = ARTDecoder(config)
-        self.fast_mixer = FastMixer(config)
 
         # Transformer encoder input projections. The tokens will be structured like
         # [latent, (robot_state), (env_state), (image_feature_map_pixels)].
@@ -229,10 +309,24 @@ class ART(nn.Module):
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
         # Final action regression head on the output of the transformer's decoder.
-        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
-        
-        self.fast_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+        if not self.config.tokenize_actions:
+            self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+            
+            self.fast_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+        else:
+            self.action_head = nn.Linear(config.dim_model, config.action_bins)
+            self.offset_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+            
+            self.fast_head = nn.Linear(config.dim_model, config.action_bins)
+            
         self.act_decoder = ACTDecoder(config)
+        
+        if config.crop_shape is not None:
+            self.do_crop = True
+            # Always use center crop for eval
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+        else: 
+            self.do_crop = False
 
         self._reset_parameters()
 
@@ -347,7 +441,7 @@ class ART(nn.Module):
 
     #     return actions, (mu, log_sigma_x2)
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor]:
+    def forward(self, batch: dict[str, Tensor]) -> Dict[str, Tensor]:
         """
         Training Forward:
         1. VLM Prefix -> Cache (Pos 0)
@@ -358,6 +452,11 @@ class ART(nn.Module):
         encoder_in_tokens = []
         encoder_in_pos_embed = []
         
+        # print("batch keys:", batch.keys())
+        # print("batch actions", batch["action"])
+        
+        # raise NotImplementedError("This forward method is incomplete and for illustration only.")
+        
         
         if self.config.robot_state_feature and self.config.encode_current_state_in_prefix:
             encoder_in_tokens.append(self.state_input_proj(batch["observation.state"][:,self.config.history_length:self.config.history_length+1,:]))
@@ -366,7 +465,9 @@ class ART(nn.Module):
             all_cam_features = []
             all_cam_pos_embed = []
             for cam_index in range(batch["observation.images"].shape[-4]):
-                img = batch["observation.images"][:, cam_index]
+                img = batch["observation.images"][:, cam_index] # [B, C, H, W]
+                if self.do_crop:
+                    img = self.center_crop(img)
                 feat = self.backbone(img)["feature_map"]
                 feat = self.encoder_img_feat_input_proj(feat)
                 pos = self.encoder_cam_feat_pos_embed(feat).to(dtype=feat.dtype)
@@ -393,7 +494,7 @@ class ART(nn.Module):
         prefix_len = cache[0][0].shape[-2]
         
         # detach cache to avoid gradients flowing into vision encoder
-        for i, layer_cache in enumerate(cache):
+        for i, _ in enumerate(cache):
             cache.layers[i].keys = cache.layers[i].keys.detach()
             cache.layers[i].values = cache.layers[i].values.detach()
         # print cache shapes, 2nd dim is 0,1 for k,v
@@ -481,7 +582,13 @@ class ART(nn.Module):
 
         fast_actions = self.fast_head(fast_out)
         
-        return self.action_head(future_out), fast_actions
+        return {
+            "action_out": self.action_head(future_out),
+            "fast_out": fast_actions,
+            "action_offsets": self.offset_head(future_out) if self.config.tokenize_actions else None
+        }
+        
+        # return {a}self.action_head(future_out), fast_actions
     
     def reset_episode(self):
         """Reset all counters and cache for a new episode."""
@@ -509,6 +616,8 @@ class ART(nn.Module):
             all_cam_pos_embed = []
             for cam_index in range(batch["observation.images"].shape[-4]):
                 img = batch["observation.images"][:, cam_index]
+                if self.do_crop:
+                    img = self.center_crop(img)
                 feat = self.backbone(img)["feature_map"]
                 feat = self.encoder_img_feat_input_proj(feat)
                 pos = self.encoder_cam_feat_pos_embed(feat).to(dtype=feat.dtype)
@@ -591,7 +700,7 @@ class ART(nn.Module):
             
             
     @torch.inference_mode()
-    def generate_next_action(self, batch: Dict) -> Tensor:
+    def generate_next_action(self, batch: Dict) -> Dict[str, Tensor]:
         """
         Generates the next action based on current state + cache.
         Incrementally updates cache and counters.
@@ -631,7 +740,8 @@ class ART(nn.Module):
             self.inference_write_offset = 0
 
         # 5. Output
-        return self.action_head(decoder_out)
+        return {"action_out": self.action_head(decoder_out),
+                "offset_out": self.offset_head(decoder_out) if self.config.tokenize_actions else None}
     
     
     def _build_pizero_mask(self, batch_size, prefix_len, hist_len, seq_len, state_padding_mask, device):
@@ -1056,3 +1166,183 @@ class ACTDecoderLayer(nn.Module):
         if not self.pre_norm:
             x = self.norm3(x)
         return x
+
+
+import torch
+import torch.nn as nn
+from typing import Tuple, Optional, Union
+
+class SpatialActionTokenizer(nn.Module):
+    """
+    N-Dimensional Torch-native tokenizer that discretizes continuous actions into a grid-based vocabulary.
+    
+    Features:
+    - Dimension Agnostic: Works for 2D, 3D, or N-D actions automatically.
+    - Vectorized Encoding: Uses stride arithmetic for fast tokenization.
+    - Buffer Management: Automatically moves with model to GPU/CPU.
+    """
+    
+    def __init__(
+        self,
+        num_bins: int = 32,
+        action_min: Union[list, tuple] = (12.0, 25.0),
+        action_max: Union[list, tuple] = (511.0, 511.0),
+    ):
+        super().__init__()
+        self.num_bins = num_bins
+        
+        # Convert inputs to tensors
+        _min = torch.tensor(action_min, dtype=torch.float32)
+        _max = torch.tensor(action_max, dtype=torch.float32)
+        
+        assert _min.shape == _max.shape, "Action min and max must have same dimension"
+        self.action_dim = len(_min)
+        self.vocab_size = num_bins ** self.action_dim
+        
+        # Register bounds as buffers
+        self.register_buffer('action_min', _min)
+        self.register_buffer('action_max', _max)
+        self.register_buffer('action_range', _max - _min)
+        
+        # Pre-compute decoding table (Vocab Size, Action Dim)
+        # This creates a lookup table where index i -> [x, y, ...] continuous values
+        self._create_vocab_embedding()
+        
+        # Pre-compute encoding basis strides for flattening N-D coordinates to 1D tokens
+        # Example for 2D (size 100): basis is [100, 1]. dot([y, x], basis) -> token_id
+        # We use powers of num_bins: [num_bins^(D-1), ..., num_bins^1, num_bins^0]
+        powers = [num_bins ** i for i in reversed(range(self.action_dim))]
+        self.register_buffer('stride_basis', torch.tensor(powers, dtype=torch.long))
+
+    def _create_vocab_embedding(self):
+        """
+        Creates a (Vocab_Size, Action_Dim) tensor containing the center value
+        of every bin. This acts like a fixed Embedding layer.
+        """
+        # 1. Create linspace for each dimension
+        grids = []
+        for i in range(self.action_dim):
+            # Centers are: min + step/2 + k*step
+            # Or simply linspace over the range
+            dim_centers = torch.linspace(
+                self.action_min[i], 
+                self.action_max[i], 
+                self.num_bins
+            )
+            grids.append(dim_centers)
+            
+        # 2. Create meshgrid (N-Dimensional)
+        # indexing='ij' ensures correct order for flattening
+        mesh = torch.meshgrid(*grids, indexing='ij')
+        
+        # 3. Stack and flatten to (Vocab_Size, Action_Dim)
+        # Stack dim -1 puts the coordinates in the last dimension
+        vocab = torch.stack(mesh, dim=-1).reshape(-1, self.action_dim)
+        
+        self.register_buffer('vocab_centers', vocab)
+
+    def forward(self, actions: torch.Tensor) -> torch.Tensor:
+        """Alias for encode."""
+        return self.encode(actions)
+
+    def encode(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Continuous (..., D) -> Token IDs (...,)
+        """
+        # 1. Normalize to [0, 1]
+        # Clamp inputs to ensure they stay within bounds
+        clamped = torch.clamp(actions, min=self.action_min, max=self.action_max)
+        norm = (clamped - self.action_min) / self.action_range
+        
+        # 2. Scale to [0, num_bins - 1] and round
+        # We subtract a tiny epsilon to prevent checking edge case at exactly 1.0
+        bin_coords = (norm * (self.num_bins - 1)).round().long()
+        
+        # 3. Flatten N-D coords to 1D token ID using dot product with strides
+        # Input: (..., D), Basis: (D) -> Output: (...,)
+        # We simply sum(coords * strides) along the last dimension
+        tokens = (bin_coords * self.stride_basis).sum(dim=-1)
+        
+        return tokens
+
+    def decode(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Token IDs (...,) -> Continuous (..., D)
+        """
+        # Use standard PyTorch embedding lookup semantics
+        # F.embedding or direct indexing works. Direct indexing is simpler for fixed buffers.
+        return self.vocab_centers[tokens]
+
+    def extra_repr(self):
+        return (f"dim={self.action_dim}, bins={self.num_bins}, "
+                f"vocab={self.vocab_size}")
+
+
+class KMeansTokenizer(nn.Module):
+    def __init__(self, centers_path="kmeans_centers.pt"):
+        super().__init__()
+        
+        # Load the pre-calculated centroids
+        # Shape: (Vocab_Size, 2)
+        centers = torch.load(centers_path)
+        
+        self.vocab_size = centers.shape[0]
+        self.action_dim = centers.shape[1] # Should be 2
+        
+        # Register as a buffer so it moves to GPU automatically with the model
+        # but is not updated during backprop (frozen codebook)
+        self.register_buffer('vocab_centers', centers)
+
+    def encode(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Finds the nearest centroid for each action.
+        Input: (Batch, ..., 2)
+        Output: (Batch, ...)
+        """
+        # 1. Flatten input to (N, 2) for cdist
+        input_shape = actions.shape
+        flat_actions = actions.view(-1, self.action_dim)
+        
+        # 2. Calculate distances
+        # torch.cdist computes euclidean distance between every row in A and every row in B
+        # Input: (N, 2), Vocab: (1024, 2) -> Output: (N, 1024)
+        # Note: cdist is heavily optimized (uses matrix multiplication under the hood)
+        dists = torch.cdist(flat_actions, self.vocab_centers)
+        
+        # 3. Find closest centroid (Argmin)
+        tokens = torch.argmin(dists, dim=1)
+        
+        # 4. Reshape back to original batch dimensions
+        return tokens.view(input_shape[:-1])
+
+    def decode(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Look up the centroid coordinates.
+        Input: (Batch, ...)
+        Output: (Batch, ..., 2)
+        """
+        # Simple embedding lookup
+        return self.vocab_centers[tokens]
+
+    def forward(self, actions):
+        return self.encode(actions)
+
+    def extra_repr(self):
+        return f"vocab_size={self.vocab_size}, dim={self.action_dim}"
+
+def spatial_action_loss(logits: torch.Tensor, target_tokens: torch.Tensor) -> torch.Tensor:
+    """
+    Cross-entropy loss for spatial action tokens.
+    
+    Args:
+        logits: (batch_size, seq_len, vocab_size) 
+        target_tokens: (batch_size, seq_len) with token IDs
+    
+    Returns:
+        loss: scalar loss value
+    """
+    # Reshape for cross entropy: (batch_size * seq_len, vocab_size) and (batch_size * seq_len,)
+    logits_flat = logits.view(-1, logits.size(-1))
+    targets_flat = target_tokens.view(-1)
+    
+    return nn.functional.cross_entropy(logits_flat, targets_flat)

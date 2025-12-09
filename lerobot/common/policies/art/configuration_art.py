@@ -92,13 +92,13 @@ class ARTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    history_length: int = 10
+    history_length: int = 0
     history_mask_prob: float = 0.0
-    chunk_size: int = 10
-    n_action_steps: int = 8
+    chunk_size: int = 100
+    n_action_steps: int = 100
     encode_current_state_in_prefix: bool = False
     
-    test_time_history: int = 10
+    test_time_history: int = 100
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -107,6 +107,13 @@ class ARTConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+    
+    tokenize_actions: bool = True
+    tokenizer_pth: str | None = "tokenizer/kmeans_centers.pt"  # path to the action tokenizer checkpoint
+    tokenize_delta_actions: bool = False
+    action_bins: int | None = None  # number of discrete action bins per action dimension
+    
+    crop_shape: tuple[int, int] | None = None  # (height, width)
 
     # Architecture.
     # Vision backbone.

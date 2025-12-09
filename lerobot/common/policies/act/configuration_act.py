@@ -92,7 +92,7 @@ class ACTConfig(PreTrainedConfig):
 
     # Input / output structure.
     n_obs_steps: int = 1
-    chunk_size: int = 8
+    chunk_size: int = 16
     n_action_steps: int = 8
     
     crop_shape: tuple[int, int] | None = None  # (height, width) 84 x 84 for pusht

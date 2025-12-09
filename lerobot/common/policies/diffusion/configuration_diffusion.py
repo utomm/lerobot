@@ -125,7 +125,7 @@ class DiffusionConfig(PreTrainedConfig):
     vision_backbone: str = "resnet18"
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
-    pretrained_backbone_weights: str | None = None
+    pretrained_backbone_weights: str | None = None # "ResNet18_Weights.IMAGENET1K_V1"
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
@@ -235,3 +235,7 @@ class DiffusionConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+    
+    @property
+    def image_delta_indices(self) -> list:
+        return list(range(1 - self.n_obs_steps, 1))

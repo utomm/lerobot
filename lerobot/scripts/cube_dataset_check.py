@@ -140,12 +140,12 @@ def analyze_actions(
             # Convert to numpy and round to nearest integers
             actions = batch["action"].numpy()
             states = batch["observation.state"].numpy()
-            # Round to handle values like 10.0 -> 10
-            actions_rounded = np.round(actions).astype(int)
+            # Round to handle values like 10.0 -> 10, don't need in cube env
+            # actions_rounded = np.round(actions).astype(int)
             delta_action = actions - states
-            all_actions.append(actions_rounded)
+            all_actions.append(actions)
             delta_actions.append(delta_action)
-            total_samples += len(actions_rounded)
+            total_samples += len(actions)
     
     # Concatenate all actions
     if all_actions:
@@ -205,7 +205,7 @@ def analyze_actions(
         # 3. Save the centroids
         # These are the geometric coordinates of your tokens
         centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
-        torch.save(centroids, "kmeans_centers.pt")
+        torch.save(centroids, "tokenizer/cube_kmeans_centers.pt")
 
         print("Saved 'kmeans_centers.pt'. You can now use the tokenizer.")
         
@@ -302,7 +302,7 @@ def main():
     parser.add_argument(
         "--repo-id",
         type=str,
-        default="lerobot/pusht",
+        default="lerobot/aloha_sim_transfer_cube_human",
         help="Name of hugging face repository containing a LeRobotDataset dataset (e.g. `lerobot/pusht`).",
     )
     parser.add_argument(

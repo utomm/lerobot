@@ -7,7 +7,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 # Install apt dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake \
+    build-essential cmake git \
     libglib2.0-0 libgl1-mesa-glx libegl1-mesa ffmpeg \
     speech-dispatcher \
     python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
@@ -21,10 +21,15 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN echo "source /opt/venv/bin/activate" >> /root/.bashrc
 
 # Install LeRobot
-COPY . /lerobot
-WORKDIR /lerobot
+COPY ./requirements-frozen.txt requirements-frozen.txt
+WORKDIR /
+
+RUN pwd
+RUN ls -la
+
 RUN pip install --upgrade --no-cache-dir pip
-RUN pip install --no-cache-dir ".[test, aloha, xarm, pusht, dynamixel]"
+RUN pip install -r requirements-frozen.txt
+# RUN pip install --no-cache-dir ".[test, aloha, pusht]"
 
 # Set EGL as the rendering backend for MuJoCo
 ENV MUJOCO_GL="egl"

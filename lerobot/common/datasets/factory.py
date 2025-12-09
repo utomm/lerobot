@@ -41,6 +41,9 @@ def resolve_delta_timestamps(
     Doesn't do anything if delta_timestamps is not specified or has already been resolve (as evidenced by
     the data type of its values).
     """
+    
+    print("keys in ds_meta.features:", ds_meta.features.keys())
+    
     delta_timestamps = {}
     for key in ds_meta.features:
         if key == "next.reward" and cfg.reward_delta_indices is not None:
@@ -49,6 +52,8 @@ def resolve_delta_timestamps(
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
         if key.startswith("observation.") and cfg.observation_delta_indices is not None:
             if key.startswith("observation.image"):
+                print("Resolving image delta timestamps...")
+                print("cfg.image_delta_indices:", cfg.image_delta_indices)
                 if cfg.image_delta_indices is not None:
                     delta_timestamps[key] = [i / ds_meta.fps for i in cfg.image_delta_indices]
                 else:

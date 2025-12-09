@@ -492,8 +492,8 @@ class ACT(nn.Module):
                 self.encoder_env_state_input_proj(batch["observation.environment_state"])
             )
             
-        print("do crop:", self.do_crop)
-        print("batch['observation.images'] shape:", batch["observation.images"].shape if "observation.images" in batch else "N/A")
+        # print("do crop:", self.do_crop)
+        # print("batch['observation.images'] shape:", batch["observation.images"].shape if "observation.images" in batch else "N/A")
 
         # Camera observation features and positional embeddings.
         if self.config.image_features:
@@ -507,7 +507,7 @@ class ACT(nn.Module):
                 else:
                     x = batch["observation.images"][:, cam_index]
                     
-                print(f"Camera {cam_index} input shape after process:", x.shape)
+                # print(f"Camera {cam_index} input shape after process:", x.shape)
                 cam_features = self.backbone(x)["feature_map"]
                 # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use
                 # buffer
@@ -526,7 +526,7 @@ class ACT(nn.Module):
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
         
-        print("encoder_in_tokens shape:", encoder_in_tokens.shape)
+        # print("encoder_in_tokens shape:", encoder_in_tokens.shape)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
