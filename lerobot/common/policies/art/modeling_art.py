@@ -70,9 +70,9 @@ class ARTPolicy(PreTrainedPolicy):
         
         if self.config.tokenize_actions:
             # self.action_tokenizer = SpatialActionTokenizer(num_bins=self.config.action_bins)
-            self.action_tokenizer = KMeansTokenizer(centers_path=self.config.tokenizer_pth)
+            self.action_tokenizer = PerDimKMeansTokenizer(centers_path=self.config.tokenizer_pth)
             if config.action_bins is None:
-                config.action_bins = self.action_tokenizer.vocab_size
+                config.action_bins = self.action_tokenizer.num_bins
             self.config.normalization_mapping["ACTION"] = NormalizationMode.IDENTITY
             
         self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
@@ -148,20 +148,25 @@ class ARTPolicy(PreTrainedPolicy):
         # querying the policy.
         out_dict = self.model.generate_next_action(batch)  # [B, 1, Dim]
         
-        actions = out_dict.get("action_out").squeeze(1)  # remove the sequence dim, because we only asked for one action at every eval step
+        # out_dict["action_out"] shape: [B, 1, Dim * Num_Bins]
+        actions_raw = out_dict.get("action_out").squeeze(1) # [B, Dim * Num_Bins]
 
-        # TODO(rcadene): make _forward return output dictionary?
         if self.config.tokenize_actions:
-            offset_out = out_dict.get("offset_out", None)  # [B, Dim]
-            if offset_out is not None:
-                offset_out = offset_out.squeeze(1)  # [B, Dim]
-            action_logits = actions # [B, C]
-            action_tokens = torch.argmax(action_logits, dim=-1)  # [B]
-            actions = self.action_tokenizer.decode(action_tokens)  # [B, action_dim]
-            actions = actions + (offset_out if offset_out is not None else 0)
+            B = actions_raw.shape[0]
+            Dim = self.action_tokenizer.action_dim
+            Bins = self.action_tokenizer.num_bins
+            
+            # 1. Reshape: [B, D*K] -> [B, D, K]
+            action_logits = actions_raw.view(B, Dim, Bins)
+            
+            # 2. Argmax per dimension: [B, D]
+            action_tokens = torch.argmax(action_logits, dim=-1)
+            
+            # 3. Decode: [B, D] -> [B, D] continuous
+            actions = self.action_tokenizer.decode(action_tokens)
+            
             if self.config.tokenize_delta_actions:
-                # need to add to current position
-                actions = actions + cache_current_state # [B, action_dim]
+                actions = actions + cache_current_state
         else:
             actions = self.unnormalize_outputs({"action": actions})["action"]
 
@@ -195,40 +200,53 @@ class ARTPolicy(PreTrainedPolicy):
                     # print("gt_actions:", gt_actions)
                     # print("batch['observation.state']:", cache_current_state[:, -self.config.chunk_size:, :])
                     gt_actions = gt_actions - cache_current_state[:, -self.config.chunk_size:, :] # [B, Seq_Len, Dim]
-                else:
-                    gt_actions = gt_actions
-                action_gt_tokens = self.action_tokenizer(gt_actions) # Returns [B, S]
-                action_gt_offsets = gt_actions - self.action_tokenizer.decode(action_gt_tokens) # [B, S, Dim], we don't have to normalize offsets because they are small values around -1 to 1
+                # Tokenizer returns [Batch, Seq, Dim]
+                action_gt_tokens = self.action_tokenizer(gt_actions)
+                
+            B, S, _ = actions_hat.shape
+            Dim = action_gt_tokens.shape[-1]
+            Bins = self.config.action_bins
+
+            # 2. View as 4D tensor: [Batch, Seq, Dim, Bins]
+            actions_hat_4d = actions_hat.view(B, S, Dim, Bins)
+            actions_hat_permuted = actions_hat_4d.permute(0, 3, 1, 2)
+            
+            
+            # TODO: correct here
+            
+            mask = ~batch["action_is_pad"] # [B, S]
+            mask = mask.unsqueeze(-1).expand(-1, -1, Dim) # [B, S, D]
+
                 
                 
                 # print("action_tokens:", action_tokens)
             
             ar_loss = (
                 F.cross_entropy(
-                    actions_hat.permute(0, 2, 1),  # (B, C, S)
+                    actions_hat_permuted,
                     action_gt_tokens,  # (B, S)
                     reduction="none",
-                ) * ~batch["action_is_pad"]
+                ) * mask
             ).mean()
             
             fast_loss = (
                 F.cross_entropy(
-                    actions_fast.permute(0, 2, 1),  # (B, C, S)
+                    actions_hat_permuted,
                     action_gt_tokens,  # (B, S)
                     reduction="none",
-                ) * ~batch["action_is_pad"]
+                ) * mask
             ).mean()
             
-            if action_offsets is not None:
-                offset_loss = (
-                    F.l1_loss(
-                        action_offsets,
-                        action_gt_offsets,
-                        reduction="none"
-                    ) * ~batch["action_is_pad"].unsqueeze(-1)
-                ).mean()
+            # if action_offsets is not None:
+            #     offset_loss = (
+            #         F.l1_loss(
+            #             action_offsets,
+            #             action_gt_offsets,
+            #             reduction="none"
+            #         ) * ~batch["action_is_pad"].unsqueeze(-1)
+            #     ).mean()
                 
-            loss_dict = {"ar_loss": ar_loss.item(), "fast_loss": fast_loss.item(), "offset_loss": offset_loss.item(), "loss": ar_loss + fast_loss + offset_loss}
+            loss_dict = {"ar_loss": ar_loss.item(), "fast_loss": fast_loss.item(), "loss": ar_loss + fast_loss}
         
         else:
         
@@ -314,10 +332,10 @@ class ART(nn.Module):
             
             self.fast_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
         else:
-            self.action_head = nn.Linear(config.dim_model, config.action_bins)
-            self.offset_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+            self.action_head = nn.Linear(config.dim_model, config.action_bins * self.config.action_feature.shape[0])
+            # self.offset_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
             
-            self.fast_head = nn.Linear(config.dim_model, config.action_bins)
+            self.fast_head = nn.Linear(config.dim_model, config.action_bins * self.config.action_feature.shape[0])
             
         self.act_decoder = ACTDecoder(config)
         
@@ -585,7 +603,7 @@ class ART(nn.Module):
         return {
             "action_out": self.action_head(future_out),
             "fast_out": fast_actions,
-            "action_offsets": self.offset_head(future_out) if self.config.tokenize_actions else None
+            # "action_offsets": self.offset_head(future_out) if self.config.tokenize_actions else None
         }
         
         # return {a}self.action_head(future_out), fast_actions
@@ -741,7 +759,8 @@ class ART(nn.Module):
 
         # 5. Output
         return {"action_out": self.action_head(decoder_out),
-                "offset_out": self.offset_head(decoder_out) if self.config.tokenize_actions else None}
+                # "offset_out": self.offset_head(decoder_out) if self.config.tokenize_actions else None}
+        }
     
     
     def _build_pizero_mask(self, batch_size, prefix_len, hist_len, seq_len, state_padding_mask, device):
@@ -1346,3 +1365,88 @@ def spatial_action_loss(logits: torch.Tensor, target_tokens: torch.Tensor) -> to
     targets_flat = target_tokens.view(-1)
     
     return nn.functional.cross_entropy(logits_flat, targets_flat)
+
+class PerDimKMeansTokenizer(nn.Module):
+    """
+    Performs 1D quantization per dimension using pre-computed centroids.
+    
+    Expected pt file shape: (Action_Dim, Num_Bins)
+    Meaning: centers[d, k] is the value of the k-th bin center for dimension d.
+    """
+    def __init__(self, centers_path: str):
+        super().__init__()
+        
+        # Load centroids: Expecting shape [Action_Dim, Num_Bins]
+        # Example: 14 dims, 100 bins -> [14, 100]
+        centers = torch.load(centers_path)
+        
+        if centers.ndim != 2:
+            raise ValueError(f"Expected centroids shape (Dim, Bins), got {centers.shape}")
+            
+        self.action_dim = centers.shape[0]
+        self.num_bins = centers.shape[1]
+        self.vocab_size = self.num_bins * self.action_dim
+        
+        # Register as buffer so it moves to GPU with model
+        self.register_buffer('centers', centers)
+        self.register_buffer('dim_offsets', torch.arange(self.action_dim) * self.num_bins)
+
+    def encode(self, actions: torch.Tensor) -> torch.Tensor:
+        """
+        Input:  [Batch, Seq, Dim] (Continuous values)
+        Output: [Batch, Seq, Dim] (Token IDs 0..Num_Bins-1)
+        """
+        # 1. Expand actions to broadcast against bins
+        # actions: [B, S, D] -> [B, S, D, 1]
+        actions_expanded = actions.unsqueeze(-1)
+        
+        # 2. Expand centers to broadcast against batch/seq
+        # centers: [D, K] -> [1, 1, D, K]
+        centers_expanded = self.centers.unsqueeze(0).unsqueeze(0)
+        
+        # 3. Calculate absolute distance for every bin in every dimension
+        # dists: [B, S, D, K]
+        dists = torch.abs(actions_expanded - centers_expanded)
+        
+        # 4. Argmin to find closest bin index
+        tokens = torch.argmin(dists, dim=-1) # [B, S, D]
+        
+        return tokens
+
+    def decode(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Input:  [Batch, Dim] (Token IDs)
+        Output: [Batch, Dim] (Continuous values)
+        """
+        # We need to gather values from self.centers [D, K]
+        # tokens is [B, S, D] containing indices k.
+        
+        # 1. Expand centers to match batch size for gather
+        # centers: [D, K] -> [1, 1, D, K] -> expand to [B, S, D, K]
+        # This can be memory intensive, so let's do it smarter:
+        
+        # Method: Gather acts on the last dimension.
+        # We assume tokens are indices into the last dim of centers.
+        
+        # tokens: [B, S, D]
+        batch, dim = tokens.shape
+        
+        # We want to map tokens[b,s,d] -> centers[d, tokens[b,s,d]]
+        # Simplest way in PyTorch without massive broadcasting:
+        
+        flat_tokens = tokens.view(-1, dim) # [N, D]
+        
+        # Result placeholder
+        # decoded = torch.zeros_like(flat_tokens, dtype=self.centers.dtype)
+        
+        # Loop over dimensions (since D is usually small, e.g., 14, this is fast enough)
+        # and significantly saves memory compared to expanding centers to [B,S,D,K]
+        
+        
+        flat_indices = flat_tokens + self.dim_offsets.view(1, -1)
+        decoded = self.centers.view(-1)[flat_indices]
+             
+        return decoded.view(batch, dim)
+
+    def forward(self, actions):
+        return self.encode(actions)

@@ -196,16 +196,23 @@ def analyze_actions(
                 percentage = (count / total_samples) * 100
                 print(f"  {tuple(action)} - {count} times ({percentage:.2f}%)")
                 
-        vocab_size = 2048
+        vocab_size = 500
         
-        print(f"Fitting K-Means with {vocab_size} clusters on {all_actions.shape} points...")
-        kmeans = KMeans(n_clusters=vocab_size, n_init=10, max_iter=300)
-        kmeans.fit(all_actions)
-
+        # DO PER-DIM K-MEANS CLUSTERING
+        per_dim_centroids = []
+        for dim in range(all_actions.shape[1]):
+            print(f"Fitting K-Means with {vocab_size} clusters on dimension {dim} with {all_actions.shape[0]} points...")
+            kmeans = KMeans(n_clusters=vocab_size, n_init=10, max_iter=300)
+            kmeans.fit(all_actions[:, dim].reshape(-1, 1))
+            per_dim_centroids.append(kmeans.cluster_centers_.flatten())
+            
+        # Combine per-dim centroids into one tensor, into [dim, vocab_size]
+        centroids = torch.tensor(np.stack(per_dim_centroids, axis=0), dtype=torch.float32)
+        torch.save(centroids, "tokenizer/pushT_per_dim_kmeans_centers.pt")
         # 3. Save the centroids
         # These are the geometric coordinates of your tokens
-        centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
-        torch.save(centroids, "kmeans_centers.pt")
+        # centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
+        # torch.save(centroids, "tokenizer/cube_kmeans_centers.pt")
 
         print("Saved 'kmeans_centers.pt'. You can now use the tokenizer.")
         
