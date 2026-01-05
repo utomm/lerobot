@@ -91,23 +91,7 @@ class ARTPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         # TODO(aliberts, rcadene): As of now, lr_backbone == lr
         # Should we remove this and just `return self.parameters()`?
-        return [
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
-                ],
-                "lr": self.config.optimizer_lr_backbone,
-            },
-        ]
+        return self.parameters()
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -168,7 +152,7 @@ class ARTPolicy(PreTrainedPolicy):
             if self.config.tokenize_delta_actions:
                 actions = actions + cache_current_state
         else:
-            actions = self.unnormalize_outputs({"action": actions})["action"]
+            actions = self.unnormalize_outputs({"action": actions_raw})["action"]
 
         self.test_step_counter += 1
         return actions
@@ -211,6 +195,9 @@ class ARTPolicy(PreTrainedPolicy):
             actions_hat_4d = actions_hat.view(B, S, Dim, Bins)
             actions_hat_permuted = actions_hat_4d.permute(0, 3, 1, 2)
             
+            actions_fast_4d = actions_fast.view(B, S, Dim, Bins)
+            actions_fast_permuted = actions_fast_4d.permute(0, 3, 1, 2)
+            
             
             # TODO: correct here
             
@@ -231,7 +218,7 @@ class ARTPolicy(PreTrainedPolicy):
             
             fast_loss = (
                 F.cross_entropy(
-                    actions_hat_permuted,
+                    actions_fast_permuted,
                     action_gt_tokens,  # (B, S)
                     reduction="none",
                 ) * mask

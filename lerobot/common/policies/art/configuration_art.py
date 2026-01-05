@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from lerobot.common.optim.optimizers import AdamWConfig
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
+from lerobot.common.optim.schedulers import DiffuserSchedulerConfig
 
 
 @PreTrainedConfig.register_subclass("art")
@@ -150,6 +151,9 @@ class ARTConfig(PreTrainedConfig):
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
+    
+    scheduler_name: str | None = None
+    scheduler_warmup_steps: int = 500
 
     def __post_init__(self):
         super().__post_init__()
@@ -180,8 +184,14 @@ class ARTConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig | None:
+        if self.scheduler_name is None:
+            return None
+        elif self.scheduler_name == "cosine":
+            return DiffuserSchedulerConfig(
+                name=self.scheduler_name,
+                num_warmup_steps=self.scheduler_warmup_steps,
+            )
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
