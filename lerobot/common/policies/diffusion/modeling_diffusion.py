@@ -257,6 +257,10 @@ class DiffusionModel(nn.Module):
                 )
             else:
                 # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
+                # print("shape of images:", batch["observation.images"].shape)
+                # only applies during trainning when n_obs_steps > 1
+                if batch["observation.images"].dim() == 5:
+                    batch["observation.images"] = batch["observation.images"].unsqueeze(1)
                 img_features = self.rgb_encoder(
                     einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
                 )
