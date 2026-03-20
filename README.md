@@ -1,79 +1,43 @@
-<p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="https://raw.githubusercontent.com/huggingface/lerobot/main/media/lerobot-logo-thumbnail.png" width="100%">
-  <br/>
-  <br/>
-</p>
+## Fork Update: MiniDiffusion (`minidp`)
 
-<div align="center">
+This fork adds a new policy type, `minidiffusion`, integrated into the policy factory and training stack.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/nightly.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://dcbadge.vercel.app/api/server/C5P34WJ68S?style=flat)](https://discord.gg/s3KuuzsPFb)
+Related paper: [Mini Diffuser: Fast Multi-task Diffusion Policy Training Using Two-level Mini-batches](https://arxiv.org/html/2505.09430v2)
 
-<!-- [![Coverage](https://codecov.io/gh/huggingface/lerobot/branch/main/graph/badge.svg?token=TODO)](https://codecov.io/gh/huggingface/lerobot) -->
+### What was added
 
-</div>
+- Policy implementation: `src/lerobot/policies/minidiffusion/`
+- Policy registration and factory wiring:
+  - `src/lerobot/policies/__init__.py`
+  - `src/lerobot/policies/factory.py`
 
-<h2 align="center">
-    <p><a href="https://huggingface.co/docs/lerobot/hope_jr">
-        Build Your Own HopeJR Robot!</a></p>
-</h2>
+### How to use
 
-<div align="center">
-  <img
-    src="https://raw.githubusercontent.com/huggingface/lerobot/main/media/hope_jr/hopejr.png"
-    alt="HopeJR robot"
-    title="HopeJR robot"
-    width="60%"
-  />
+Train on PushT (example command used in this fork):
 
-  <p><strong>Meet HopeJR – A humanoid robot arm and hand for dexterous manipulation!</strong></p>
-  <p>Control it with exoskeletons and gloves for precise hand movements.</p>
-  <p>Perfect for advanced manipulation tasks! 🤖</p>
+```bash
+lerobot-train --policy.type=minidiffusion  --dataset.repo_id=lerobot/pusht_image\
+ --env.type=pusht --seed=100000 --batch_size=32 --log_freq=200 --wandb.disable_artifact=true\
+ --steps=100000  --eval_freq=10000 --save_freq=10000 --wandb.enable=true --policy.repo_id=id\
+ --wandb.project=minidp --policy.push_to_hub=false --policy.level2_batch_size=8 --job_name=minidp-32-8
 
-  <p><a href="https://huggingface.co/docs/lerobot/hope_jr">
-      See the full HopeJR tutorial here.</a></p>
-</div>
+```
 
-<br/>
+### Models and logs
 
-<h2 align="center">
-    <p><a href="https://huggingface.co/docs/lerobot/so101">
-        Build Your Own SO-101 Robot!</a></p>
-</h2>
+- Hugging Face model repo (published checkpoint):
+  - [`you2who/mini-diffusion-pusht`](https://huggingface.co/you2who/mini-diffusion-pusht)
+- W&B project dashboard:
+  - [`hu2240877635/minidp`](https://api.wandb.ai/links/hu2240877635/defcr4wu)
 
-<div align="center">
-  <table>
-    <tr>
-      <td align="center"><img src="https://raw.githubusercontent.com/huggingface/lerobot/main/media/so101/so101.webp" alt="SO-101 follower arm" title="SO-101 follower arm" width="90%"/></td>
-      <td align="center"><img src="https://raw.githubusercontent.com/huggingface/lerobot/main/media/so101/so101-leader.webp" alt="SO-101 leader arm" title="SO-101 leader arm" width="90%"/></td>
-    </tr>
-  </table>
-
-  <p><strong>Meet the updated SO100, the SO-101 – Just €114 per arm!</strong></p>
-  <p>Train it in minutes with a few simple moves on your laptop.</p>
-  <p>Then sit back and watch your creation act autonomously! 🤯</p>
-
-  <p><a href="https://huggingface.co/docs/lerobot/so101">
-      See the full SO-101 tutorial here.</a></p>
-
-  <p>Want to take it to the next level? Make your SO-101 mobile by building LeKiwi!</p>
-  <p>Check out the <a href="https://huggingface.co/docs/lerobot/lekiwi">LeKiwi tutorial</a> and bring your robot to life on wheels.</p>
-
-  <img src="https://raw.githubusercontent.com/huggingface/lerobot/main/media/lekiwi/kiwi.webp" alt="LeKiwi mobile robot" title="LeKiwi mobile robot" width="50%">
-</div>
-
-<br/>
 
 <h3 align="center">
     <p>LeRobot: State-of-the-art AI for real-world robotics</p>
 </h3>
 
 ---
+
+
 
 🤗 LeRobot aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry to robotics so that everyone can contribute and benefit from sharing datasets and pretrained models.
 
